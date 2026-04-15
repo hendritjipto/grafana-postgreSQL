@@ -1,0 +1,10 @@
+# Environment — never commit real credentials
+.env
+
+# Secrets directory — contains DSN with plaintext password
+secrets/postgres_dsn
+secrets/postgres_dsn_replica
+
+# Docker volumes (if mounted locally)
+postgres_data/
+alloy_data/

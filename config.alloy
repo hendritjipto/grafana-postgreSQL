@@ -1,0 +1,135 @@
+// ============================================================
+// Grafana Alloy — Database Observability: PostgreSQL
+// Requires Alloy v1.15.0+
+// ============================================================
+
+// ------------------------------------------------------------------
+// Secrets: PostgreSQL DSNs
+// ------------------------------------------------------------------
+local.file "postgres_secret_grafana" {
+  filename  = "/var/lib/alloy/secrets/postgres_dsn"
+  is_secret = true
+}
+
+local.file "postgres_secret_replica" {
+  filename  = "/var/lib/alloy/secrets/postgres_dsn_replica"
+  is_secret = true
+}
+
+// ------------------------------------------------------------------
+// PostgreSQL metrics exporters — primary and replica
+// ------------------------------------------------------------------
+prometheus.exporter.postgres "postgres_primary" {
+  data_source_names  = [local.file.postgres_secret_grafana.content]
+  enabled_collectors = ["stat_statements", "database", "locks", "long_running_transactions", "postmaster", "replication", "stat_bgwriter", "stat_database", "stat_user_tables", "statio_user_indexes"]
+}
+
+prometheus.exporter.postgres "postgres_replica" {
+  data_source_names  = [local.file.postgres_secret_replica.content]
+  enabled_collectors = ["stat_statements", "database", "locks", "long_running_transactions", "postmaster", "replication", "stat_bgwriter", "stat_database", "stat_user_tables", "statio_user_indexes"]
+}
+
+// ------------------------------------------------------------------
+// Database Observability component (query details, samples, schema)
+// ------------------------------------------------------------------
+database_observability.postgres "postgres_grafana" {
+  data_source_name  = local.file.postgres_secret_grafana.content
+  forward_to        = [loki.relabel.database_observability_postgres_grafana.receiver]
+  targets           = prometheus.exporter.postgres.postgres_primary.targets
+  enable_collectors = ["query_details", "query_samples", "schema_details", "explain_plans", "logs"]
+}
+
+// ------------------------------------------------------------------
+// Loki relabeling — attach instance label before forwarding logs
+// ------------------------------------------------------------------
+loki.relabel "database_observability_postgres_grafana" {
+  forward_to = [loki.write.logs_service.receiver]
+
+  rule {
+    target_label = "instance"
+    replacement  = "postgres-primary"
+  }
+}
+
+// ------------------------------------------------------------------
+// Discovery relabeling — attach job label to metric targets
+// ------------------------------------------------------------------
+discovery.relabel "database_observability_postgres_grafana" {
+  targets = database_observability.postgres.postgres_grafana.targets
+
+  rule {
+    target_label = "job"
+    replacement  = "integrations/db-o11y"
+  }
+}
+
+// ------------------------------------------------------------------
+// Prometheus scrape → relabel → remote write pipeline
+// ------------------------------------------------------------------
+prometheus.scrape "database_observability_postgres_grafana" {
+  targets    = discovery.relabel.database_observability_postgres_grafana.output
+  forward_to = [prometheus.relabel.database_observability_postgres_grafana.receiver]
+}
+
+prometheus.relabel "database_observability_postgres_grafana" {
+  forward_to = [prometheus.remote_write.metrics_service.receiver]
+
+  rule {
+    target_label = "instance"
+    replacement  = "postgres-primary"
+  }
+}
+
+// ------------------------------------------------------------------
+// Replica metrics pipeline
+// ------------------------------------------------------------------
+discovery.relabel "postgres_replica" {
+  targets = prometheus.exporter.postgres.postgres_replica.targets
+
+  rule {
+    target_label = "job"
+    replacement  = "integrations/db-o11y"
+  }
+}
+
+prometheus.scrape "postgres_replica" {
+  targets    = discovery.relabel.postgres_replica.output
+  forward_to = [prometheus.relabel.postgres_replica.receiver]
+}
+
+prometheus.relabel "postgres_replica" {
+  forward_to = [prometheus.remote_write.metrics_service.receiver]
+
+  rule {
+    target_label = "instance"
+    replacement  = "postgres-replica"
+  }
+}
+
+// ------------------------------------------------------------------
+// Prometheus remote write → Grafana Cloud
+// ------------------------------------------------------------------
+prometheus.remote_write "metrics_service" {
+  endpoint {
+    url = sys.env("GCLOUD_HOSTED_METRICS_URL")
+
+    basic_auth {
+      username = sys.env("GCLOUD_HOSTED_METRICS_ID")
+      password = sys.env("GCLOUD_RW_API_KEY")
+    }
+  }
+}
+
+// ------------------------------------------------------------------
+// Loki write → Grafana Cloud
+// ------------------------------------------------------------------
+loki.write "logs_service" {
+  endpoint {
+    url = sys.env("GCLOUD_HOSTED_LOGS_URL")
+
+    basic_auth {
+      username = sys.env("GCLOUD_HOSTED_LOGS_ID")
+      password = sys.env("GCLOUD_RW_API_KEY")
+    }
+  }
+}
